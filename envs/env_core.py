@@ -73,7 +73,7 @@ class EnvCore(object):
 
         # Reward settings
         self.reward_per_bit = 0  # 每bit数据的奖励参数（最开始是5e-7）
-        self.energy_penalty = 5e-4  # 能耗惩罚系数
+        self.energy_penalty = 10e-4  # 能耗惩罚系数
         self.completion_bonus_half = 15.0  # 完成50%的奖励
         self.completion_bonus_full = 30.0  # 完成100%的奖励
         self.service_reward = 0.1  # 提供卸载服务的小奖励
@@ -90,7 +90,7 @@ class EnvCore(object):
         self.grid_size = 200.0  # 格子边长 200m
         self.grid_cols = int(np.ceil(self.ground_area / self.grid_size))  # 10列
         self.grid_rows = int(np.ceil(self.ground_area / self.grid_size))  # 10行
-        self.coverage_reward = 10.0  # 每覆盖一个新格子的奖励（辅助探索，约为发现奖励的1/10）
+        self.coverage_reward = 50.0  # 每覆盖一个新格子的奖励（辅助探索，约为发现奖励的1/10）
 
         # Observation: 10x10 grid map flattened to 100-dim vector (0=uncovered, 1=covered, 2=self position)
         self.obs_shape = (self.grid_rows * self.grid_cols,)
@@ -103,6 +103,8 @@ class EnvCore(object):
         self.terminals = None
         self.terminal_discovered = None
         self.episode_count = -1  # episode 计数器（从-1开始，reset后第一个episode为0，与runner对齐）
+        self.padding_mode = False  # 提前达成终止条件后，剩余step仅计数不执行动作
+        self.padding_end_reason = None
 
     def _build_terminal_states(self):
         # 获取固定的终端基准位置（从 function.py）
@@ -154,6 +156,8 @@ class EnvCore(object):
 
     def reset(self):
         self.current_step = 0
+        self.padding_mode = False
+        self.padding_end_reason = None
         self.episode_count += 1  # 每次 reset 时 episode 编号自增
         self.uav_positions = generate_uav_initial_positions(
             num_uavs=self.agent_num,
@@ -211,6 +215,44 @@ class EnvCore(object):
 
         if actions.ndim == 1:
             actions = actions.reshape(self.agent_num, -1)
+
+        # 若提前达成终止条件，后续step进入占位模式：仅计数，不执行任何动作
+        if self.padding_mode:
+            self.current_step += 1
+            timeout = self.current_step >= self.episode_limit
+            obs = self._get_obs()
+            rewards = [[0.0] for _ in range(self.agent_num)]
+            dones = [bool(timeout) for _ in range(self.agent_num)]
+            discovered_count = int(np.sum(self.terminal_discovered))
+            discovery_ratio = discovered_count / self.num_terminals if self.num_terminals > 0 else 1.0
+            infos = []
+            for uav_id in range(self.agent_num):
+                infos.append({
+                    "selected_terminals": [],
+                    "service_decision": False,
+                    "num_terminals_to_serve": 0,
+                    "num_served_terminals": 0,
+                    "processed_bits": 0.0,
+                    "propulsion_energy_j": 0.0,
+                    "computation_energy_j": 0.0,
+                    "communication_energy_j": 0.0,
+                    "total_energy_j": 0.0,
+                    "battery": float(self.uav_battery[uav_id]),
+                    "num_invalid_services": 0,
+                    "uav_depleted": bool(self.uav_depleted[uav_id]),
+                    "newly_discovered_terminals": [],
+                    "num_discovered_terminals": discovered_count,
+                    "all_tasks_completed": bool(discovered_count == self.num_terminals),
+                    "task_completion_ratio": float(discovery_ratio),
+                    "episode_step": int(self.current_step),
+                    "out_of_battery": bool(np.any(self.uav_depleted)),
+                    "timeout": bool(timeout),
+                    "all_terminals_discovered": bool(discovered_count == self.num_terminals),
+                    "terminal_discovery_ratio": float(discovery_ratio),
+                    "padding_mode": True,
+                    "padding_reason": self.padding_end_reason,
+                })
+            return [obs, rewards, dones, infos]
 
         rewards = []
         dones = []
@@ -429,32 +471,38 @@ class EnvCore(object):
         all_discovered = discovered_count == self.num_terminals
         out_of_battery = bool(np.any(self.uav_depleted))
         timeout = self.current_step >= self.episode_limit
-        episode_end = (
-            timeout
-            or all_discovered
-            or out_of_battery
-        )
+
+        # 提前终止条件进入padding模式，直到episode_limit才真正done
+        if not self.padding_mode and not timeout and (all_discovered or out_of_battery):
+            self.padding_mode = True
+            self.padding_end_reason = "all_discovered" if all_discovered else "out_of_battery"
+            early_reason = "终端全部发现" if all_discovered else "电量耗尽"
+            print("\n=== Episode 提前结束（进入padding）===")
+            print(f"Episode: {self.episode_count}  |  当前Step: {self.current_step} / {self.episode_limit}  |  原因: {early_reason}")
+            print(f"发现终端数: {discovered_count} / {self.num_terminals}")
+            print("后续step将仅占位计数，不执行动作，直到episode_limit后切换下一episode。")
+            print("=" * 42 + "\n")
+
+        episode_end = bool(timeout)
         # 添加终局惩罚      
         for uav_id in range(self.agent_num):
-            # 电池耗尽惩罚（只在刚耗尽的那一步惩罚一次）
-            if self.uav_battery[uav_id] <= 0.0 and not self.uav_depleted[uav_id]:
-                rewards[uav_id][0] -= self.battery_depleted_penalty
-            
             # 超时未完成发现目标的惩罚
             if timeout and not all_discovered:
                 rewards[uav_id][0] -= self.timeout_penalty
-            
+
             dones.append(bool(episode_end))
             infos[uav_id]["all_tasks_completed"] = bool(all_discovered)
             infos[uav_id]["task_completion_ratio"] = float(discovery_ratio)
             infos[uav_id]["episode_step"] = int(self.current_step)
-            infos[uav_id]["out_of_battery"] = bool(self.uav_depleted[uav_id])
+            infos[uav_id]["out_of_battery"] = bool(np.any(self.uav_depleted))
             infos[uav_id]["timeout"] = bool(timeout)
             infos[uav_id]["all_terminals_discovered"] = bool(all_discovered)
             infos[uav_id]["terminal_discovery_ratio"] = float(discovery_ratio)
             infos[uav_id]["num_discovered_terminals"] = int(np.sum(self.terminal_discovered))
+            infos[uav_id]["padding_mode"] = bool(self.padding_mode)
+            infos[uav_id]["padding_reason"] = self.padding_end_reason
 
-        # Episode结束时输出统计信息
+        # Episode真正结束时输出统计信息
         if episode_end:
             # 判断结束原因
             if all_discovered:
