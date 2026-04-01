@@ -206,7 +206,7 @@ def get_config():
     parser.add_argument(
         "--num_env_steps",
         type=int,
-        default=40e5,
+        default=10e5,
         help="Number of environment steps to train (default: 5e5, increased for longer episodes)",
     )
     parser.add_argument(
@@ -226,7 +226,7 @@ def get_config():
     )
 
     # replay buffer parameters
-    parser.add_argument("--episode_length", type=int, default=4000, help="Max length for any episode")
+    parser.add_argument("--episode_length", type=int, default=1000, help="Max length for any episode")
 
     # network parameters
     parser.add_argument(
@@ -314,7 +314,7 @@ def get_config():
     )
 
     # optimizer parameters
-    parser.add_argument("--lr", type=float, default=0.001, help="learning rate (default: 5e-4)")
+    parser.add_argument("--lr", type=float, default=0.0002, help="learning rate (default: 5e-4)")
     parser.add_argument(
         "--critic_lr",
         type=float,
@@ -352,7 +352,7 @@ def get_config():
     parser.add_argument(
         "--entropy_coef",
         type=float,
-        default=0.01,
+        default=0.001,
         help="entropy term coefficient (default: 0.01)",
     )
     parser.add_argument(
